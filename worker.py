@@ -1,11 +1,14 @@
 import logging
 import threading
 import time
+from json import loads
 from queue import Queue
 
+from paho.mqtt import client as mqtt
+from redis import Redis
 from serial import Serial
 
-from domain.values import Read, Units, load_reads, save_reads
+from domain.values import Read, Units, save_read_to_redis
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,31 +130,76 @@ class QueueConsumer:
                 time.sleep(0.1)
 
 
+class MQTTConsumer:
+    def __init__(self, client: mqtt.Client, input_topic: str, output_queue: Queue):
+        self.__client = client
+        self.__topic = input_topic
+        self._running = False
+        self._output_queue = output_queue
+
+    def stop(self):
+        self._running = False
+
+    def __on_message(self, client, userdata, message):
+        logger = logging.getLogger(__name__)
+        payload = message.payload.decode()
+        logger.info(f"Received message: {payload}")
+        try:
+            for read in loads(payload).values():
+                self._output_queue.put(
+                    Read(value=read["value"], source=read["id"], units=read["unit"])
+                )
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+
+    def runner(self):
+        logger = logging.getLogger(__name__)
+        self._running = True
+        self.__client.subscribe(self.__topic)
+        self.__client.on_message = self.__on_message
+        logger.info("Running MQTT consumer")
+        self.__client.loop_forever()
+
+
+class ReadLogger:
+    def __init__(self, input_queue: Queue, redis_client: Redis):
+        self.__input_queue = input_queue
+        self._running = False
+        self._redis_client = redis_client
+
+    def stop(self):
+        self._running = False
+
+    def runner(self):
+        logger = logging.getLogger(__name__)
+        self._running = True
+        while self._running:
+            if not self.__input_queue.empty():
+                read: Read = self.__input_queue.get()
+                logger.info(f"Consumed message: {read}")
+                save_read_to_redis(self._redis_client, read)
+            else:
+                time.sleep(0.1)
+
+
 def main():
     received_queue = Queue()
-    byte_receiver = SerialBytesReceiver(
-        header=0x7E,
-        uart=Serial(port="/dev/tty.usbmodemF412FA65971C2", baudrate=115200),
-        queue=received_queue,
+    client = mqtt.Client()
+    client.connect(host="broker.hivemq.com", port=1883)
+    redis_client = Redis(host="redis", port=6379, db=0)
+
+    mqtt_consumer = MQTTConsumer(
+        client=client, input_topic="sda-2024/20240928", output_queue=received_queue
     )
 
-    queue_consumer = QueueConsumer(queue=received_queue)
+    read_logger = ReadLogger(input_queue=received_queue, redis_client=redis_client)
 
-    received_thread = threading.Thread(target=byte_receiver.runner)
-    consumer_thread = threading.Thread(target=queue_consumer.runner)
-
-    received_thread.start()
-    consumer_thread.start()
-
-    try:
-        while True:
-            time.sleep(0.1)
-    except KeyboardInterrupt:
-        byte_receiver.stop()
-        queue_consumer.stop()
-        received_thread.join()
-        consumer_thread.join()
-        print("Programa terminado por el usuario")
+    mqtt_consumer_thread = threading.Thread(
+        target=mqtt_consumer.runner, name="MQTTConsumer"
+    )
+    read_logger_thread = threading.Thread(target=read_logger.runner, name="ReadLogger")
+    mqtt_consumer_thread.start()
+    read_logger_thread.start()
 
 
 if __name__ == "__main__":

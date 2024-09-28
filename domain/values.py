@@ -1,5 +1,8 @@
 import json
 from enum import Enum
+from time import time
+
+from redis import Redis
 
 
 class Units(int, Enum):
@@ -12,10 +15,11 @@ class Units(int, Enum):
 
 
 class Read:
-    def __init__(self, value: int, source: int, units: Units):
+    def __init__(self, value: int, source: int, units: Units, timestamp: int = None):
         self.value = value
         self.source = source
         self.units = units
+        self.timestamp = int(time())
 
     def __add__(self, other):
         if not isinstance(other, Read):
@@ -38,15 +42,22 @@ class Read:
         return self.__dict__
 
 
-def load_reads():
-    try:
-        with open("reads.json", "r") as f:
-            data = json.load(f)
-            return {int(k): Read(**v) for k, v in data.items()}
-    except FileNotFoundError:
-        return {}
+def save_read_to_redis(redis_client: Redis, read: Read):
+    """
+    Save a Read object to Redis using the source as the key
+    """
+    key = f"read:{read.source}"
+    value = json.dumps(read.dict())
+    redis_client.set(key, value)
 
 
-def save_reads(reads):
-    with open("reads.json", "w") as f:
-        json.dump({str(k): v.__dict__ for k, v in reads.items()}, f)
+def get_read_from_redis(redis_client: Redis, source: int) -> Read:
+    """
+    Retrieve a Read object from Redis given a source
+    """
+    key = f"read:{source}"
+    value = redis_client.get(key)
+    if value is None:
+        return None
+    read_dict = json.loads(value)
+    return Read(**read_dict)
